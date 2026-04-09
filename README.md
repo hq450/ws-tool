@@ -70,13 +70,14 @@ bash ./scripts/build-release.sh
 默认目标：
 
 - `x86_64`
+- `armv5te`
 - `armv7a`
 - `armv7hf`
 - `aarch64`
 
 默认启用 `UPX` 压缩：
 
-- `armv5te` 如未来启用，使用 `UPX 4.2.4`
+- `armv5te` 使用 `UPX 4.2.4`
 - 其它目标使用 `UPX 5.0.2`
 
 ## 与 fancyss 的关系

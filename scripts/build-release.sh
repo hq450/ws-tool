@@ -15,7 +15,7 @@ Usage:
   bash ./scripts/build-release.sh [--no-upx] [target...]
 
 Targets:
-  x86_64 armv7a armv7hf aarch64
+  x86_64 armv5te armv7a armv7hf aarch64
 
 Options:
   --no-upx      Build without UPX compression
@@ -108,6 +108,9 @@ build_target() {
                 echo "==> skipping UPX for $name (current static binary is not packable by UPX reliably)"
                 upx_bin=""
                 ;;
+            armv5te)
+                upx_bin="$UPX_4_2_4"
+                ;;
             *) upx_bin="$UPX_5_0_2" ;;
         esac
         if [[ -n "$upx_bin" ]]; then
@@ -144,13 +147,16 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ${#TARGETS[@]} -eq 0 ]]; then
-    TARGETS=(x86_64 armv7a armv7hf aarch64)
+    TARGETS=(x86_64 armv5te armv7a armv7hf aarch64)
 fi
 
 ZIG_BIN="$(find_latest_zig)"
 if [[ "$WITH_UPX" == "1" ]]; then
+    UPX_4_2_4="$(find_required_command "${UPX_4_2_4:-}" "upx-4.2.4" "UPX 4.2.4")"
     UPX_5_0_2="$(find_required_command "${UPX_5_0_2:-}" "upx-5.0.2" "UPX 5.0.2")"
+    require_executable "$UPX_4_2_4" "UPX 4.2.4"
     require_executable "$UPX_5_0_2" "UPX 5.0.2"
+    require_upx_version "$UPX_4_2_4" "4.2.4"
     require_upx_version "$UPX_5_0_2" "5.0.2"
 fi
 mkdir -p "$OUT_DIR"
@@ -158,6 +164,7 @@ mkdir -p "$OUT_DIR"
 echo "Version: $VERSION"
 echo "Using Zig: $ZIG_BIN ($("$ZIG_BIN" version))"
 if [[ "$WITH_UPX" == "1" ]]; then
+    echo "Using UPX 4.2.4: $UPX_4_2_4"
     echo "Using UPX 5.0.2: $UPX_5_0_2"
 else
     echo "UPX: disabled (--no-upx)"
@@ -167,6 +174,7 @@ echo
 for target in "${TARGETS[@]}"; do
     case "$target" in
         x86_64) build_target x86_64 x86_64-linux-musl baseline ;;
+        armv5te) build_target armv5te arm-linux-musleabi arm1176jzf_s ;;
         armv7a) build_target armv7a arm-linux-musleabi mpcorenovfp ;;
         armv7hf) build_target armv7hf arm-linux-musleabihf cortex_a9 ;;
         aarch64) build_target aarch64 aarch64-linux-musl generic ;;
