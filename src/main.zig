@@ -313,7 +313,9 @@ fn pipeThreadMain(args: PipeThreadArgs) void {
                 if (clean.len > 0 and clean[clean.len - 1] == '\r') {
                     clean = clean[0 .. clean.len - 1];
                 }
-                args.shared.writeFrame(clean, .text) catch return;
+                if (clean.len > 0) {
+                    args.shared.writeFrame(clean, .text) catch return;
+                }
                 line_len = 0;
                 continue;
             }
@@ -325,6 +327,19 @@ fn pipeThreadMain(args: PipeThreadArgs) void {
             line_buf[line_len] = byte;
             line_len += 1;
         }
+        // fancyss also uses websocketd as a lightweight command transport, and
+        // some commands intentionally print a single line without a trailing newline.
+        // Flush the current chunk so clients do not wait forever for EOF.
+        if (!overflow and line_len > 0) {
+            var clean = line_buf[0..line_len];
+            if (clean.len > 0 and clean[clean.len - 1] == '\r') {
+                clean = clean[0 .. clean.len - 1];
+            }
+            if (clean.len > 0) {
+                args.shared.writeFrame(clean, .text) catch return;
+            }
+            line_len = 0;
+        }
     }
     if (overflow) {
         args.shared.writeFrame("[ws-tool] output line too long", .text) catch {};
@@ -333,7 +348,9 @@ fn pipeThreadMain(args: PipeThreadArgs) void {
         if (clean.len > 0 and clean[clean.len - 1] == '\r') {
             clean = clean[0 .. clean.len - 1];
         }
-        args.shared.writeFrame(clean, .text) catch {};
+        if (clean.len > 0) {
+            args.shared.writeFrame(clean, .text) catch {};
+        }
     }
 }
 
