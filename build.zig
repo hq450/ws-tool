@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
         .name = "websocketd",
         .root_module = root_module,
     });
+    exe.linkSystemLibrary("atomic");
 
     b.installArtifact(exe);
 
