@@ -25,6 +25,7 @@ const Shared = struct {
     stream: net.Stream,
     child: process.Child,
     child_exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    pipe_threads_done: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     stream_closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     write_mutex: std.Thread.Mutex = .{},
     close_mutex: std.Thread.Mutex = .{},
@@ -33,6 +34,15 @@ const Shared = struct {
         self.close_mutex.lock();
         defer self.close_mutex.unlock();
         if (self.stream_closed.load(.acquire)) return;
+        self.stream_closed.store(true, .release);
+        self.stream.close();
+    }
+
+    fn gracefulCloseStream(self: *Shared) void {
+        self.close_mutex.lock();
+        defer self.close_mutex.unlock();
+        if (self.stream_closed.load(.acquire)) return;
+        std.Thread.sleep(1000 * std.time.ns_per_ms);
         self.stream_closed.store(true, .release);
         self.stream.close();
     }
@@ -53,6 +63,14 @@ const Shared = struct {
         defer self.write_mutex.unlock();
         if (self.stream_closed.load(.acquire)) return error.ConnectionClosed;
         try self.ws.writeMessage(data, opcode);
+        try self.ws.flush();
+    }
+
+    fn markPipeDoneAndMaybeClose(self: *Shared) void {
+        const done = self.pipe_threads_done.fetchAdd(1, .acq_rel) + 1;
+        if (done >= 2 and self.child_exited.load(.acquire)) {
+            self.gracefulCloseStream();
+        }
     }
 };
 
@@ -268,11 +286,11 @@ fn serveWebSocket(config: *const Config, ws: *http.Server.WebSocket, connection:
     readLoop(&shared);
 
     shared.terminateChild();
-    shared.closeStream();
 
     wait_thread.join();
     stdout_thread.join();
     stderr_thread.join();
+    shared.gracefulCloseStream();
 }
 
 fn readLoop(shared: *Shared) void {
@@ -294,6 +312,7 @@ fn readLoop(shared: *Shared) void {
 }
 
 fn pipeThreadMain(args: PipeThreadArgs) void {
+    defer args.shared.markPipeDoneAndMaybeClose();
     var buf: [4096]u8 = undefined;
     var line_buf: [max_line_len]u8 = undefined;
     var line_len: usize = 0;
@@ -329,16 +348,9 @@ fn pipeThreadMain(args: PipeThreadArgs) void {
         }
         // fancyss also uses websocketd as a lightweight command transport, and
         // some commands intentionally print a single line without a trailing newline.
-        // Flush the current chunk so clients do not wait forever for EOF.
+        // Flush only the valid UTF-8 prefix so text frames never split a multibyte rune.
         if (!overflow and line_len > 0) {
-            var clean = line_buf[0..line_len];
-            if (clean.len > 0 and clean[clean.len - 1] == '\r') {
-                clean = clean[0 .. clean.len - 1];
-            }
-            if (clean.len > 0) {
-                args.shared.writeFrame(clean, .text) catch return;
-            }
-            line_len = 0;
+            flushValidUtf8Prefix(args.shared, &line_buf, &line_len) catch return;
         }
     }
     if (overflow) {
@@ -354,10 +366,40 @@ fn pipeThreadMain(args: PipeThreadArgs) void {
     }
 }
 
+fn flushValidUtf8Prefix(shared: *Shared, line_buf: *[max_line_len]u8, line_len: *usize) !void {
+    const current = line_buf[0..line_len.*];
+    const prefix_len = validUtf8PrefixLen(current);
+    if (prefix_len == 0) return;
+
+    try shared.writeFrame(current[0..prefix_len], .text);
+
+    const remain = line_len.* - prefix_len;
+    if (remain > 0) {
+        std.mem.copyForwards(u8, line_buf[0..remain], line_buf[prefix_len..line_len.*]);
+    }
+    line_len.* = remain;
+}
+
+fn validUtf8PrefixLen(bytes: []const u8) usize {
+    if (bytes.len == 0) return 0;
+    if (std.unicode.utf8ValidateSlice(bytes)) return bytes.len;
+
+    var trim: usize = 1;
+    while (trim <= 3 and trim < bytes.len) : (trim += 1) {
+        const candidate_len = bytes.len - trim;
+        if (std.unicode.utf8ValidateSlice(bytes[0..candidate_len])) {
+            return candidate_len;
+        }
+    }
+    return 0;
+}
+
 fn waitThreadMain(args: WaitThreadArgs) void {
     _ = args.shared.child.wait() catch {};
     args.shared.child_exited.store(true, .release);
-    args.shared.closeStream();
+    if (args.shared.pipe_threads_done.load(.acquire) >= 2) {
+        args.shared.gracefulCloseStream();
+    }
 }
 
 fn buildChildEnv(arena: Allocator, config: *const Config, connection: net.Server.Connection, request: *http.Server.Request) !process.EnvMap {
