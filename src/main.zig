@@ -5,7 +5,7 @@ const http = std.http;
 const net = std.net;
 const process = std.process;
 
-const version_text = "0.1.0";
+const version_text = "0.1.1";
 
 const default_port: u16 = 8080;
 const max_header_value_len: usize = 4096;
@@ -90,12 +90,31 @@ const WaitThreadArgs = struct {
     shared: *Shared,
 };
 
+var shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var active_connections: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
+fn handleShutdownSignal(_: i32) callconv(.c) void {
+    shutdown_requested.store(true, .release);
+}
+
+fn installSignalHandlers() void {
+    if (builtin.os.tag == .windows) return;
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = handleShutdownSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+}
+
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
     const config = try parseArgs(allocator, args);
+    installSignalHandlers();
 
     const listen_addr = try parseListenAddress(config.address, config.port);
     var server = try listen_addr.listen(.{ .reuse_address = true });
@@ -103,7 +122,9 @@ pub fn main() !void {
 
     while (true) {
         const connection = server.accept() catch |err| {
+            if (shutdown_requested.load(.acquire) and err == error.Interrupted) break;
             std.log.err("accept failed: {s}", .{@errorName(err)});
+            if (shutdown_requested.load(.acquire)) break;
             continue;
         };
         const thread = try std.Thread.spawn(.{}, connectionThreadMain, .{ConnectionThreadArgs{
@@ -111,6 +132,11 @@ pub fn main() !void {
             .connection = connection,
         }});
         thread.detach();
+    }
+
+    const shutdown_deadline_ns = std.time.nanoTimestamp() + 15 * std.time.ns_per_s;
+    while (active_connections.load(.acquire) > 0 and std.time.nanoTimestamp() < shutdown_deadline_ns) {
+        std.Thread.sleep(100 * std.time.ns_per_ms);
     }
 }
 
@@ -229,6 +255,8 @@ fn printHelp() void {
 }
 
 fn connectionThreadMain(args: ConnectionThreadArgs) void {
+    _ = active_connections.fetchAdd(1, .acq_rel);
+    defer _ = active_connections.fetchSub(1, .acq_rel);
     defer args.connection.stream.close();
 
     var send_buffer: [4096]u8 = undefined;
@@ -328,13 +356,7 @@ fn pipeThreadMain(args: PipeThreadArgs) void {
                     line_len = 0;
                     continue;
                 }
-                var clean = line_buf[0..line_len];
-                if (clean.len > 0 and clean[clean.len - 1] == '\r') {
-                    clean = clean[0 .. clean.len - 1];
-                }
-                if (clean.len > 0) {
-                    args.shared.writeFrame(clean, .text) catch return;
-                }
+                emitOutputFrame(args.shared, line_buf[0..line_len]) catch return;
                 line_len = 0;
                 continue;
             }
@@ -346,52 +368,20 @@ fn pipeThreadMain(args: PipeThreadArgs) void {
             line_buf[line_len] = byte;
             line_len += 1;
         }
-        // fancyss also uses websocketd as a lightweight command transport, and
-        // some commands intentionally print a single line without a trailing newline.
-        // Flush only the valid UTF-8 prefix so text frames never split a multibyte rune.
-        if (!overflow and line_len > 0) {
-            flushValidUtf8Prefix(args.shared, &line_buf, &line_len) catch return;
-        }
     }
     if (overflow) {
         args.shared.writeFrame("[ws-tool] output line too long", .text) catch {};
     } else if (line_len > 0) {
-        var clean = line_buf[0..line_len];
-        if (clean.len > 0 and clean[clean.len - 1] == '\r') {
-            clean = clean[0 .. clean.len - 1];
-        }
-        if (clean.len > 0) {
-            args.shared.writeFrame(clean, .text) catch {};
-        }
+        emitOutputFrame(args.shared, line_buf[0..line_len]) catch {};
     }
 }
 
-fn flushValidUtf8Prefix(shared: *Shared, line_buf: *[max_line_len]u8, line_len: *usize) !void {
-    const current = line_buf[0..line_len.*];
-    const prefix_len = validUtf8PrefixLen(current);
-    if (prefix_len == 0) return;
-
-    try shared.writeFrame(current[0..prefix_len], .text);
-
-    const remain = line_len.* - prefix_len;
-    if (remain > 0) {
-        std.mem.copyForwards(u8, line_buf[0..remain], line_buf[prefix_len..line_len.*]);
+fn emitOutputFrame(shared: *Shared, raw: []const u8) !void {
+    var clean = raw;
+    if (clean.len > 0 and clean[clean.len - 1] == '\r') {
+        clean = clean[0 .. clean.len - 1];
     }
-    line_len.* = remain;
-}
-
-fn validUtf8PrefixLen(bytes: []const u8) usize {
-    if (bytes.len == 0) return 0;
-    if (std.unicode.utf8ValidateSlice(bytes)) return bytes.len;
-
-    var trim: usize = 1;
-    while (trim <= 3 and trim < bytes.len) : (trim += 1) {
-        const candidate_len = bytes.len - trim;
-        if (std.unicode.utf8ValidateSlice(bytes[0..candidate_len])) {
-            return candidate_len;
-        }
-    }
-    return 0;
+    try shared.writeFrame(clean, .text);
 }
 
 fn waitThreadMain(args: WaitThreadArgs) void {
