@@ -5,7 +5,7 @@ const http = std.http;
 const net = std.net;
 const process = std.process;
 
-const version_text = "0.1.1";
+const version_text = "0.1.2";
 
 const default_port: u16 = 8080;
 const max_header_value_len: usize = 4096;
@@ -368,6 +368,9 @@ fn pipeThreadMain(args: PipeThreadArgs) void {
             line_buf[line_len] = byte;
             line_len += 1;
         }
+        if (!overflow and line_len > 0 and n < buf.len) {
+            flushValidUtf8Prefix(args.shared, &line_buf, &line_len) catch return;
+        }
     }
     if (overflow) {
         args.shared.writeFrame("[ws-tool] output line too long", .text) catch {};
@@ -381,7 +384,37 @@ fn emitOutputFrame(shared: *Shared, raw: []const u8) !void {
     if (clean.len > 0 and clean[clean.len - 1] == '\r') {
         clean = clean[0 .. clean.len - 1];
     }
-    try shared.writeFrame(clean, .text);
+    if (clean.len > 0) {
+        try shared.writeFrame(clean, .text);
+    }
+}
+
+fn flushValidUtf8Prefix(shared: *Shared, line_buf: *[max_line_len]u8, line_len: *usize) !void {
+    const current = line_buf[0..line_len.*];
+    const prefix_len = validUtf8PrefixLen(current);
+    if (prefix_len == 0) return;
+
+    try emitOutputFrame(shared, current[0..prefix_len]);
+
+    const remain = line_len.* - prefix_len;
+    if (remain > 0) {
+        std.mem.copyForwards(u8, line_buf[0..remain], line_buf[prefix_len..line_len.*]);
+    }
+    line_len.* = remain;
+}
+
+fn validUtf8PrefixLen(bytes: []const u8) usize {
+    if (bytes.len == 0) return 0;
+    if (std.unicode.utf8ValidateSlice(bytes)) return bytes.len;
+
+    var trim: usize = 1;
+    while (trim <= 3 and trim < bytes.len) : (trim += 1) {
+        const candidate_len = bytes.len - trim;
+        if (std.unicode.utf8ValidateSlice(bytes[0..candidate_len])) {
+            return candidate_len;
+        }
+    }
+    return 0;
 }
 
 fn waitThreadMain(args: WaitThreadArgs) void {
